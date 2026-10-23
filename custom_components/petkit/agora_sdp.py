@@ -100,6 +100,18 @@ class SDPParser:
                         "encoding": m[2] if len(m) > 2 else None,
                     }
                 )
+            case "rtcp-fb" if val:
+                v = val.split(None, 2)
+                if len(v) >= 2 and (
+                    v[0] == "*" or (v[0].isascii() and v[0].isdecimal())
+                ):
+                    target.setdefault("rtcpFb", []).append(
+                        {
+                            "payload": "*" if v[0] == "*" else int(v[0]),
+                            "type": v[1],
+                            "subtype": v[2] if len(v) > 2 else "",
+                        }
+                    )
             case "fmtp" if val:
                 v = val.split(None, 1)
                 target["fmtp"].append(
@@ -198,7 +210,7 @@ def parse_offer_to_ortc(offer_sdp: str) -> dict[str, Any]:
             }
 
             for feedback in media.get("rtcpFb", []):
-                if feedback.get("payload") == payload_type:
+                if feedback.get("payload") in (payload_type, "*"):
                     codec["rtcpFeedbacks"].append(
                         {
                             "type": feedback.get("type"),

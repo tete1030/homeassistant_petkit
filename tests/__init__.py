@@ -1,1 +1,1 @@
-"""Tests for the Petkit OpenPetBowl schedule helpers."""
+"""Tests for the Petkit integration."""

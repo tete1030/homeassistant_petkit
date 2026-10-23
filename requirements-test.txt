@@ -1,0 +1,10 @@
+-r requirements.txt
+av==19.0.0
+go2rtc-client==0.4.0
+homeassistant==2026.10.2
+numpy>=2.3.2
+pytest>=8.3
+pytest-asyncio>=1.2
+pytest-cov>=6
+PyTurboJPEG==1.8.3
+sqlalchemy>=2
