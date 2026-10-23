@@ -21,7 +21,7 @@ from homeassistant.components.http.const import KEY_HASS_REFRESH_TOKEN_ID, KEY_H
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .agora_rtm import AgoraRTMSignaling
-from .agora_websocket import AgoraWebSocketHandler
+from .agora_websocket import AgoraVideoNotPublishedError, AgoraWebSocketHandler
 from .const import AGORA_APP_ID, DOMAIN, LOGGER
 from .go2rtc_stream import get_go2rtc_stream_manager
 from .webrtc_common import _get_live_feed_for_webrtc
@@ -118,6 +118,8 @@ class PetkitAgoraUpstreamManager:
         self.hass = hass
         self._lock = asyncio.Lock()
         self._sessions: dict[str, AgoraUpstreamSession] = {}
+        self._device_locks: dict[str, asyncio.Lock] = {}
+        self._closing = False
 
     async def create_session(
         self,
@@ -125,8 +127,19 @@ class PetkitAgoraUpstreamManager:
         offer_sdp: str,
     ) -> tuple[str, str]:
         """Create or replace one direct Agora session for the device."""
+        if self._closing:
+            raise RuntimeError("Agora upstream manager is closing")
         device_id = str(camera.device.id)
-        await self.close_session(device_id)
+        async with self._device_locks.setdefault(device_id, asyncio.Lock()):
+            if self._closing:
+                raise RuntimeError("Agora upstream manager is closing")
+            return await self._create_session_locked(camera, offer_sdp, device_id)
+
+    async def _create_session_locked(
+        self, camera: PetkitWebRTCCamera, offer_sdp: str, device_id: str
+    ) -> tuple[str, str]:
+        """Complete old teardown before starting this device's replacement."""
+        await self._close_session_locked(device_id)
 
         live_feed = await camera.async_get_live_feed(refresh=True)
         if live_feed is None:
@@ -137,6 +150,8 @@ class PetkitAgoraUpstreamManager:
             raise RuntimeError("Failed to retrieve Agora edge servers")
 
         agora_rtm = AgoraRTMSignaling(AGORA_APP_ID)
+        session_id = secrets.token_hex(16)
+        connection_lost = False
 
         async def refresh_rtc_token() -> str | None:
             refreshed_live_feed = await camera.async_get_live_feed(refresh=True)
@@ -146,8 +161,10 @@ class PetkitAgoraUpstreamManager:
             return refreshed_live_feed.rtc_token
 
         def _on_connection_lost() -> None:
+            nonlocal connection_lost
+            connection_lost = True
             self.hass.async_create_task(
-                self.close_session(device_id),
+                self.close_session(device_id, session_id=session_id),
                 f"petkit upstream cleanup {device_id}",
             )
 
@@ -172,40 +189,6 @@ class PetkitAgoraUpstreamManager:
             agora_response,
         )
 
-        rtm_started = await agora_rtm.start_live(live_feed)
-        if not rtm_started:
-            LOGGER.warning(
-                "go2rtc upstream start_live/heartbeat not active for %s",
-                device_id,
-            )
-
-        session_id = secrets.token_hex(16)
-        try:
-            answer_sdp = await agora_handler.connect_and_join(
-                live_feed=live_feed,
-                offer_sdp=offer_sdp,
-                session_id=session_id,
-                app_id=AGORA_APP_ID,
-                agora_response=agora_response,
-            )
-        except Exception:
-            await asyncio.gather(
-                agora_handler.disconnect(),
-                agora_rtm.stop_live(send_stop=True),
-                return_exceptions=True,
-            )
-            raise
-
-        if not answer_sdp:
-            await asyncio.gather(
-                agora_handler.disconnect(),
-                agora_rtm.stop_live(send_stop=True),
-                return_exceptions=True,
-            )
-            raise RuntimeError(
-                "Agora upstream negotiation did not return an SDP answer"
-            )
-
         session = AgoraUpstreamSession(
             session_id=session_id,
             camera=camera,
@@ -213,35 +196,93 @@ class PetkitAgoraUpstreamManager:
             agora_rtm=agora_rtm,
             location_path=f"/api/petkit/whep_upstream/{device_id}/{session_id}",
         )
-        session.refresh_task = self.hass.async_create_background_task(
-            self._refresh_tokens(session),
-            f"petkit go2rtc upstream refresh {device_id}",
-        )
-
-        async with self._lock:
-            self._sessions[device_id] = session
+        registered = False
+        try:
+            rtm_started = await agora_rtm.start_live(live_feed)
+            if not rtm_started:
+                LOGGER.warning(
+                    "go2rtc upstream start_live/heartbeat not active for %s",
+                    device_id,
+                )
+            answer_sdp = await agora_handler.connect_and_join(
+                live_feed=live_feed,
+                offer_sdp=offer_sdp,
+                session_id=session_id,
+                app_id=AGORA_APP_ID,
+                agora_response=agora_response,
+            )
+            if not answer_sdp:
+                raise RuntimeError(
+                    "Agora upstream negotiation did not return an SDP answer"
+                )
+            if connection_lost or not agora_handler.has_negotiated_video:
+                raise AgoraVideoNotPublishedError(
+                    "Agora upstream has no active announced video publication"
+                )
+            async with self._lock:
+                if self._closing:
+                    raise RuntimeError("Agora upstream manager is closing")
+                if connection_lost or not agora_handler.has_negotiated_video:
+                    raise AgoraVideoNotPublishedError(
+                        "Agora video publication lost before session registration"
+                    )
+                session.refresh_task = self.hass.async_create_background_task(
+                    self._refresh_tokens(session),
+                    f"petkit go2rtc upstream refresh {device_id}",
+                )
+                self._sessions[device_id] = session
+                registered = True
+        finally:
+            # The registry owns cleanup only after negotiation succeeds.
+            if not registered:
+                await self._finish_session_cleanup(session)
 
         return session_id, answer_sdp
 
-    async def close_session(self, device_id: str) -> bool:
+    async def close_session(
+        self, device_id: str, *, session_id: str | None = None
+    ) -> bool:
         """Close one direct Agora session."""
+        async with self._device_locks.setdefault(device_id, asyncio.Lock()):
+            return await self._close_session_locked(device_id, session_id=session_id)
+
+    async def _close_session_locked(
+        self, device_id: str, *, session_id: str | None = None
+    ) -> bool:
+        """Ignore callbacks and DELETE requests belonging to an older session."""
         async with self._lock:
-            session = self._sessions.pop(device_id, None)
-
-        if session is None:
-            return False
-
-        if session.refresh_task is not None:
-            session.refresh_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await session.refresh_task
-
-        await asyncio.gather(
-            session.agora_handler.disconnect(),
-            session.agora_rtm.stop_live(send_stop=True),
-            return_exceptions=True,
-        )
+            session = self._sessions.get(device_id)
+            if session is None or (
+                session_id is not None and session.session_id != session_id
+            ):
+                return False
+            self._sessions.pop(device_id)
+        await self._finish_session_cleanup(session)
         return True
+
+    async def _finish_session_cleanup(self, session: AgoraUpstreamSession) -> None:
+        """Keep the device lock until teardown finishes, even if HTTP is cancelled."""
+
+        async def cleanup() -> None:
+            tasks = [
+                session.agora_handler.disconnect(),
+                session.agora_rtm.stop_live(send_stop=True),
+            ]
+            if session.refresh_task is not None:
+                session.refresh_task.cancel()
+                tasks.append(session.refresh_task)
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        task = asyncio.create_task(cleanup())
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        task.result()
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def has_session(self, device_id: str) -> bool:
         """Return whether one device currently has an active upstream session."""
@@ -280,9 +321,9 @@ class PetkitAgoraUpstreamManager:
         return True
 
     async def close_all(self) -> None:
-        """Close all active upstream sessions."""
-        async with self._lock:
-            device_ids = list(self._sessions)
+        """Drain registered and in-flight sessions before unloading the manager."""
+        self._closing = True
+        device_ids = list(self._device_locks)
         for device_id in device_ids:
             await self.close_session(device_id)
 
@@ -630,7 +671,7 @@ class PetkitUpstreamWhepSessionView(HomeAssistantView):
             return auth_error
 
         if not await _get_upstream_manager(request.app["hass"]).close_session(
-            device_id
+            device_id, session_id=session_id
         ):
             return web.Response(status=404, text="No active upstream WHEP session")
 

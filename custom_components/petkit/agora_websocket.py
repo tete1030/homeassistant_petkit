@@ -36,6 +36,10 @@ def _create_ws_ssl_context() -> ssl.SSLContext:
 _SSL_CONTEXT = _create_ws_ssl_context()
 
 
+class AgoraVideoNotPublishedError(RuntimeError):
+    """Signaling joined, but no usable video publication was announced."""
+
+
 @dataclass
 class OfferSdpInfo:
     """Selected pieces of the browser offer SDP used for answer generation."""
@@ -84,6 +88,7 @@ class AgoraWebSocketHandler:
 
         self._joined = False
         self._answer_sdp: str | None = None
+        self._answer_video_uid: int | None = None
         self._pending_answer_ortc: dict[str, Any] | None = None
         self._pending_offer_info: OfferSdpInfo | None = None
         self._rtc_token: str | None = None
@@ -104,7 +109,9 @@ class AgoraWebSocketHandler:
             "error": self._handle_error,
             "on_rtp_capability_change": self._handle_rtp_capability_change,
             "on_user_online": self._handle_user_online,
+            "on_user_offline": self._handle_user_offline,
             "on_add_video_stream": self._handle_add_video_stream,
+            "on_remove_stream": self._handle_remove_stream,
         }
 
     def add_ice_candidate(self, candidate: RTCIceCandidateInit) -> None:
@@ -199,9 +206,11 @@ class AgoraWebSocketHandler:
                         )
                     return answer_sdp
 
-                await websocket.close()
-                self._websocket = None
+                await self.disconnect()
 
+            except (AgoraVideoNotPublishedError, asyncio.CancelledError):
+                await self.disconnect()
+                raise
             except TimeoutError:
                 LOGGER.warning("WebSocket connection timeout for %s", ws_url)
                 await self.disconnect()
@@ -248,15 +257,17 @@ class AgoraWebSocketHandler:
 
         except TimeoutError:
             if (
-                self._pending_answer_ortc is not None
-                and self._pending_offer_info is not None
-            ):
-                LOGGER.warning(
-                    "Timeout waiting for announced video stream; falling back to early SDP answer"
+                self._declare_remote_video_ssrc
+                and not self._has_published_video()
+                and (
+                    self._pending_answer_ortc is not None
+                    or self._answer_sdp is not None
                 )
-                answer = self._finalize_pending_answer()
-                if answer:
-                    return answer
+            ):
+                raise AgoraVideoNotPublishedError(
+                    "Agora video publication timeout: no announced video SSRC; "
+                    "online/join success is not video readiness"
+                ) from None
             LOGGER.error("Timeout waiting for join_v3 response")
         except WebSocketException as err:
             LOGGER.error("WebSocket error while waiting for join response: %s", err)
@@ -393,10 +404,7 @@ class AgoraWebSocketHandler:
         self._pending_answer_ortc = ortc
         self._pending_offer_info = offer_info
 
-        if self._declare_remote_video_ssrc and not any(
-            isinstance(stream.get("ssrcId"), int)
-            for stream in self._video_streams.values()
-        ):
+        if self._declare_remote_video_ssrc and not self._has_published_video():
             LOGGER.debug("Waiting for on_add_video_stream before finalizing SDP answer")
             return None
 
@@ -408,7 +416,7 @@ class AgoraWebSocketHandler:
         answer_sdp = message.get("sdp")
         if answer_sdp:
             self._answer_sdp = answer_sdp
-            return answer_sdp
+            return self._finalize_pending_answer()
         return None
 
     async def _handle_p2p_lost(self, response: dict[str, Any]) -> None:
@@ -437,16 +445,67 @@ class AgoraWebSocketHandler:
         if isinstance(uid, int):
             self._online_users.add(uid)
 
-    async def _handle_add_video_stream(self, response: dict[str, Any]) -> None:
+    async def _handle_user_offline(self, response: dict[str, Any]) -> None:
+        """Remove presence only on an explicit offline notification."""
+        message = response.get("_message") or {}
+        if not isinstance(message, dict):
+            return
+        uid = message.get("uid")
+        if type(uid) is int:
+            self._online_users.discard(uid)
+            await self._handle_remove_stream(response)
+
+    async def _handle_remove_stream(self, response: dict[str, Any]) -> None:
+        """Forget the removed publication without inventing an offline reason."""
+        message = response.get("_message") or {}
+        if not isinstance(message, dict):
+            return
+        uid = message.get("uid")
+        if type(uid) is not int:
+            return
+        self._video_streams.pop(uid, None)
+        self._subscribed_video_streams = {
+            pair for pair in self._subscribed_video_streams if pair[0] != uid
+        }
+        if uid != self._answer_video_uid:
+            return
+
+        self._joined = False
+        self._answer_sdp = None
+        self._answer_video_uid = None
+        # WHEP has a fixed remote SSRC; reuse requires a fresh negotiation.
+        self._connection_state = "DISCONNECTED"
+        LOGGER.warning("Agora negotiated video publication removed: uid=%s", uid)
+        if self._disconnect_task is None or self._disconnect_task.done():
+            self._disconnect_task = asyncio.create_task(self.disconnect())
+        self._fire_connection_lost()
+
+    def _has_published_video(self) -> bool:
+        """Require real publication metadata, not online presence or guessed SSRCs."""
+        return any(
+            type(stream.get("ssrcId")) is int
+            and 0 < stream["ssrcId"] <= 0xFFFFFFFF
+            and (uid, stream["ssrcId"]) in self._subscribed_video_streams
+            for uid, stream in self._video_streams.items()
+        )
+
+    @property
+    def has_negotiated_video(self) -> bool:
+        """Return signaling readiness, not proof of decoded video or picture quality."""
+        return self.is_connected and self._joined and self._has_published_video()
+
+    async def _handle_add_video_stream(self, response: dict[str, Any]) -> str | None:
         """Auto-subscribe to newly announced video stream."""
-        message = response.get("_message", {})
+        message = response.get("_message") or {}
+        if not isinstance(message, dict):
+            return None
         uid = message.get("uid")
         ssrc_id = message.get("ssrcId")
         rtx_ssrc_id = message.get("rtxSsrcId")
         cname = message.get("cname")
         is_video = bool(message.get("video"))
 
-        if not isinstance(uid, int) or not is_video:
+        if type(uid) is not int or not is_video:
             return None
 
         LOGGER.debug(
@@ -461,27 +520,34 @@ class AgoraWebSocketHandler:
             "cname": cname,
         }
 
-        if isinstance(ssrc_id, int):
+        if type(ssrc_id) is int and 0 < ssrc_id <= 0xFFFFFFFF:
             await self._subscribe_video_stream(uid=uid, ssrc_id=ssrc_id)
-            if (
-                self._pending_answer_ortc is not None
-                and self._pending_offer_info is not None
-            ):
+            if self._pending_answer_ortc is not None or self._answer_sdp is not None:
                 return self._finalize_pending_answer()
 
         return None
 
     def _finalize_pending_answer(self) -> str | None:
         """Generate the deferred SDP answer once enough stream metadata exists."""
+        if self._declare_remote_video_ssrc and not self._has_published_video():
+            return None
         if self._pending_answer_ortc is None or self._pending_offer_info is None:
-            return self._answer_sdp
-
-        answer_sdp = self._generate_answer_sdp(
-            self._pending_answer_ortc,
-            self._pending_offer_info,
-        )
+            answer_sdp = self._answer_sdp
+        else:
+            answer_sdp = self._generate_answer_sdp(
+                self._pending_answer_ortc,
+                self._pending_offer_info,
+            )
         if answer_sdp:
             self._joined = True
+            if self._declare_remote_video_ssrc:
+                self._answer_video_uid = next(
+                    uid
+                    for uid, stream in self._video_streams.items()
+                    if type(stream.get("ssrcId")) is int
+                    and 0 < stream["ssrcId"] <= 0xFFFFFFFF
+                    and (uid, stream["ssrcId"]) in self._subscribed_video_streams
+                )
             self._answer_sdp = answer_sdp
             self._pending_answer_ortc = None
             self._pending_offer_info = None
@@ -609,7 +675,11 @@ class AgoraWebSocketHandler:
         )
         if not has_video_marker:
             return None
-        if not isinstance(uid, int) or not isinstance(ssrc_id, int):
+        if (
+            type(uid) is not int
+            or type(ssrc_id) is not int
+            or not 0 < ssrc_id <= 0xFFFFFFFF
+        ):
             return None
         return (uid, ssrc_id)
 
@@ -624,7 +694,8 @@ class AgoraWebSocketHandler:
                 pending = [
                     (uid, data.get("ssrcId"))
                     for uid, data in self._video_streams.items()
-                    if isinstance(data.get("ssrcId"), int)
+                    if type(data.get("ssrcId")) is int
+                    and 0 < data["ssrcId"] <= 0xFFFFFFFF
                 ]
                 if not pending:
                     continue
@@ -877,8 +948,12 @@ class AgoraWebSocketHandler:
         if not self._declare_remote_video_ssrc:
             return None
 
-        for stream in self._video_streams.values():
-            if isinstance(stream.get("ssrcId"), int):
+        for uid, stream in self._video_streams.items():
+            if (
+                type(stream.get("ssrcId")) is int
+                and 0 < stream["ssrcId"] <= 0xFFFFFFFF
+                and (uid, stream["ssrcId"]) in self._subscribed_video_streams
+            ):
                 return stream
         return None
 
@@ -1203,14 +1278,18 @@ class AgoraWebSocketHandler:
             await asyncio.gather(*tasks_to_wait, return_exceptions=True)
 
         if self._websocket:
+            websocket = self._websocket
             with contextlib.suppress(WebSocketException):
-                await self._websocket.close()
-            self._websocket = None
+                await websocket.close()
+            if self._websocket is websocket:
+                self._websocket = None
 
         self._joined = False
         self._answer_sdp = None
+        self._answer_video_uid = None
         self._pending_answer_ortc = None
         self._pending_offer_info = None
         self._connection_state = "DISCONNECTED"
         self._video_streams.clear()
         self._subscribed_video_streams.clear()
+        self._online_users.clear()
