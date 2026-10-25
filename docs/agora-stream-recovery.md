@@ -67,6 +67,36 @@ The ordinary non-fixed-SSRC browser mode retains its existing readiness path.
 mean subscription acknowledgement, authenticated RTP, a decoded first frame,
 or acceptable picture quality.
 
+## Token renewal requires a confirmed reply
+
+The Agora SDK emits `on_token_privilege_will_expire` before expiry and expects
+the new token to be accepted by the signaling connection. The previous handler
+sent `renew_token` and discarded its response. `on_token_privilege_did_expire`
+only wrote an error log, so a rejected or lost renewal could leave the WHEP
+session alive until the server withdrew the remote publication.
+
+The handler now:
+
+- sends `renew_token` in a background task so the WebSocket receive loop can
+  still read the reply;
+- records the request ID and waits for the matching reply with a bounded
+  timeout and one bounded retry;
+- accepts only an explicit successful result;
+- treats provider failure, send failure, timeout, a rejected request, or
+  `on_token_privilege_did_expire` as a reason to invalidate the current WHEP
+  session.
+
+Invalidating the session deliberately reuses the existing owner cleanup and
+consumer retry path. It does not attempt an in-place `join` under an already
+negotiated fixed-SSRC WHEP answer, and it does not add blind pre-subscriptions.
+The next WHEP request must obtain a fresh token and receive a real video
+publication before it can return success.
+
+The observed removal messages do not contain a rejection reason. A renewal
+reply is therefore not invented as the cause of every withdrawal; this patch
+only removes the silent-success behavior and makes an unconfirmed renewal
+fail closed.
+
 ## Safe replacement and teardown
 
 Per-device lifecycle serialization completes old teardown before new activation.
@@ -136,6 +166,7 @@ isolated package namespace, without bootstrapping the whole integration.
 Network edges are fake; no Home Assistant instance, credentials, camera or
 media connection is used. Tests cover actual SDP generation, real WHEP view
 responses, malformed/absent publication, removal and re-publication, stale
-callbacks/DELETE, concurrent creation, cancellation, and shutdown.
+callbacks/DELETE, token-renewal acknowledgement/timeout, concurrent creation,
+cancellation, and shutdown.
 
 These are offline regression tests, not deployment or picture-quality acceptance.

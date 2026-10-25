@@ -243,6 +243,126 @@ async def test_invalid_ssrc_never_subscribed(handler, ssrc):
     assert not any(m["_type"] == "subscribe" for m in handler._websocket.sent)
 
 
+async def test_renew_token_waits_for_matching_success(handler):
+    """A renewal is complete only after its own request id succeeds."""
+    handler._rtc_token = "synthetic-token"
+    reply = None
+
+    class ReplySocket(Socket):
+        """Reply after recording the real outgoing request."""
+
+        async def send(self, raw):
+            nonlocal reply
+            await super().send(raw)
+            request = self.sent[-1]
+            if request["_type"] == "renew_token":
+                reply = asyncio.create_task(
+                    handler._handle_ws_message(
+                        {"_id": request["_id"], "_result": "success"}
+                    )
+                )
+                await asyncio.sleep(0)
+
+    socket = handler._websocket = ReplySocket()
+    assert await handler._send_renew_token()
+    assert reply is not None
+    await reply
+    assert socket.sent[-1]["_type"] == "renew_token"
+
+
+async def test_renew_token_rejects_unmatched_reply(handler):
+    """A reply with another request id cannot confirm this renewal."""
+    handler._rtc_token = "synthetic-token"
+    handler._websocket = Socket()
+    waiter = asyncio.create_task(handler._send_renew_token())
+    async with asyncio.timeout(2):
+        while not handler._token_renewals:
+            await asyncio.sleep(0)
+    request = handler._websocket.sent[-1]
+    await handler._handle_ws_message({"_id": "different", "_result": "success"})
+    assert not waiter.done()
+    await handler._handle_ws_message({"_id": request["_id"], "_result": "failed"})
+    assert not await waiter
+
+
+async def test_token_warning_does_not_block_message_loop(handler):
+    """The receive loop must remain active while a renewal awaits its reply."""
+    handler._rtc_token = "synthetic-token"
+
+    class RenewingSocket(Socket):
+        """Emit a warning, then reply after observing the outgoing request."""
+
+        def __init__(self):
+            super().__init__()
+            self._message_count = 0
+            self._blocked = asyncio.Event()
+
+        async def __anext__(self):
+            if self._message_count == 0:
+                self._message_count += 1
+                return json.dumps({"_type": "on_token_privilege_will_expire"})
+            if self._message_count == 1:
+                while not any(
+                    message.get("_type") == "renew_token" for message in self.sent
+                ):
+                    await asyncio.sleep(0)
+                self._message_count += 1
+                request = self.sent[-1]
+                return json.dumps({"_id": request["_id"], "_result": "success"})
+            await self._blocked.wait()
+            raise StopAsyncIteration
+
+    socket = handler._websocket = RenewingSocket()
+    loop_task = asyncio.create_task(handler._message_loop(socket))
+    async with asyncio.timeout(2):
+        while handler._token_renew_task is None:
+            await asyncio.sleep(0)
+        renew_task = handler._token_renew_task
+        await renew_task
+    handler._on_connection_lost.assert_not_called()
+    loop_task.cancel()
+    await asyncio.gather(loop_task, return_exceptions=True)
+
+
+async def test_renew_token_timeout_requests_new_session(
+    handler, streaming, monkeypatch
+):
+    """An unconfirmed renewal must fail closed and trigger owner recovery."""
+    monkeypatch.setattr(streaming.ws, "TOKEN_RENEW_TIMEOUT_SECONDS", 0.01)
+    handler._rtc_token = "synthetic-token"
+    handler._websocket = Socket()
+    callback = handler._on_connection_lost
+    await handler._handle_ws_message({"_type": "on_token_privilege_will_expire"})
+    assert handler._token_renew_task is not None
+    await handler._token_renew_task
+    callback.assert_called_once_with()
+    assert (
+        sum(message["_type"] == "renew_token" for message in handler._websocket.sent)
+        == 2
+    )
+
+
+async def test_token_expiry_notifies_owner(handler):
+    """Expiry requires a fresh session, not only an error log."""
+    callback = handler._on_connection_lost
+    await handler._handle_ws_message({"_type": "on_token_privilege_did_expire"})
+    callback.assert_called_once_with()
+    assert handler._on_connection_lost is None
+
+
+async def test_disconnect_cancels_pending_token_renewal(handler):
+    """Closing a session must not leave a renewal task or waiter behind."""
+    handler._rtc_token = "synthetic-token"
+    handler._websocket = Socket()
+    handler._start_token_renewal()
+    async with asyncio.timeout(2):
+        while not handler._token_renewals:
+            await asyncio.sleep(0)
+    await handler.disconnect()
+    assert handler._token_renew_task is None
+    assert handler._token_renewals == {}
+
+
 async def test_no_publication_timeout_is_not_sdp_success(handler, streaming):
     """Joined-without-video raises a distinct failure, not an early answer."""
     assert await join(handler) is None

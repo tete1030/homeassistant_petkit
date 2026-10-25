@@ -34,6 +34,9 @@ def _create_ws_ssl_context() -> ssl.SSLContext:
 
 
 _SSL_CONTEXT = _create_ws_ssl_context()
+TOKEN_RENEW_TIMEOUT_SECONDS = 5.0
+TOKEN_RENEW_ATTEMPTS = 2
+TOKEN_RENEW_RETRY_DELAY_SECONDS = 0.25
 
 
 class AgoraVideoNotPublishedError(RuntimeError):
@@ -85,6 +88,8 @@ class AgoraWebSocketHandler:
         self._message_loop_task: asyncio.Task[None] | None = None
         self._ping_task: asyncio.Task[None] | None = None
         self._subscribe_retry_task: asyncio.Task[None] | None = None
+        self._token_renew_task: asyncio.Task[None] | None = None
+        self._token_renewals: dict[str, asyncio.Future[dict[str, Any]]] = {}
 
         self._joined = False
         self._answer_sdp: str | None = None
@@ -284,18 +289,7 @@ class AgoraWebSocketHandler:
                     response = json.loads(raw_message)
                 except json.JSONDecodeError:
                     continue
-
-                message_type = response.get("_type", "")
-                LOGGER.debug("WS ← [%s] %s", message_type, response)
-
-                if message_type in self._message_handlers:
-                    await self._message_handlers[message_type](response)
-
-                if message_type == "on_token_privilege_will_expire":
-                    LOGGER.warning("Agora token expiring soon, sending renew_token")
-                    await self._send_renew_token()
-                elif message_type == "on_token_privilege_did_expire":
-                    LOGGER.error("Agora token expired")
+                await self._handle_ws_message(response)
 
         except asyncio.CancelledError:
             LOGGER.debug("Agora message loop cancelled")
@@ -305,6 +299,24 @@ class AgoraWebSocketHandler:
             self._fire_connection_lost()
         finally:
             self._connection_state = "DISCONNECTED"
+
+    async def _handle_ws_message(self, response: dict[str, Any]) -> None:
+        """Dispatch one parsed signaling message, including request replies."""
+        message_type = response.get("_type", "")
+        LOGGER.debug("WS ← [%s] %s", message_type, response)
+
+        if "_id" in response and "_result" in response:
+            await self._handle_reply(response)
+
+        if message_type in self._message_handlers:
+            await self._message_handlers[message_type](response)
+
+        if message_type == "on_token_privilege_will_expire":
+            LOGGER.warning("Agora token expiring soon, sending renew_token")
+            self._start_token_renewal()
+        elif message_type == "on_token_privilege_did_expire":
+            LOGGER.error("Agora token expired; a fresh session is required")
+            self._fire_connection_lost()
 
     async def _ping_loop(self) -> None:
         """Keep WebSocket session alive with ping messages."""
@@ -324,30 +336,95 @@ class AgoraWebSocketHandler:
         except (WebSocketException, OSError) as err:
             LOGGER.debug("Agora ping loop ended: %s", err)
 
-    async def _send_renew_token(self) -> None:
-        """Send renew_token with current rtc token."""
+    def _start_token_renewal(self) -> None:
+        """Start one acknowledgement-tracked token renewal at a time."""
+        if self._token_renew_task and not self._token_renew_task.done():
+            return
+        self._token_renew_task = asyncio.create_task(self._renew_token())
+
+    async def _renew_token(self) -> None:
+        """Renew the RTC token or invalidate the current WHEP session."""
+        try:
+            confirmed = False
+            for attempt in range(TOKEN_RENEW_ATTEMPTS):
+                confirmed = await self._send_renew_token()
+                if confirmed:
+                    break
+                if attempt + 1 < TOKEN_RENEW_ATTEMPTS:
+                    LOGGER.warning("Agora token renewal was not confirmed; retrying")
+                    await asyncio.sleep(TOKEN_RENEW_RETRY_DELAY_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("Unexpected failure while renewing Agora token")
+            confirmed = False
+        finally:
+            if self._token_renew_task is asyncio.current_task():
+                self._token_renew_task = None
+
+        if not confirmed and self._connection_state == "CONNECTED":
+            LOGGER.error("Agora token renewal was not confirmed")
+            self._fire_connection_lost()
+
+    async def _send_renew_token(self) -> bool:
+        """Send renew_token and wait for the matching success reply."""
         if self._rtc_token_provider:
             try:
                 refreshed_token = await self._rtc_token_provider()
             except Exception as err:  # noqa: BLE001
                 LOGGER.debug("Failed to refresh RTC token for renew_token: %s", err)
-                return
+                return False
             if not refreshed_token:
                 LOGGER.debug(
                     "RTC token refresh returned empty value; skipping renew_token"
                 )
-                return
+                return False
             self._rtc_token = refreshed_token
 
         if not self._websocket or not self._rtc_token:
-            return
+            return False
 
+        request_id = secrets.token_hex(3)
         renew_message = {
-            "_id": secrets.token_hex(3),
+            "_id": request_id,
             "_type": "renew_token",
             "_message": {"token": self._rtc_token},
         }
-        await self._websocket.send(json.dumps(renew_message))
+        future = asyncio.get_running_loop().create_future()
+        self._token_renewals[request_id] = future
+        try:
+            await self._websocket.send(json.dumps(renew_message))
+            async with asyncio.timeout(TOKEN_RENEW_TIMEOUT_SECONDS):
+                response = await future
+        except (TimeoutError, WebSocketException, OSError) as err:
+            LOGGER.debug("renew_token confirmation failed: %s", err)
+            return False
+        finally:
+            self._token_renewals.pop(request_id, None)
+
+        if str(response.get("_result", "")).lower() == "success":
+            return True
+
+        message = response.get("_message")
+        if not isinstance(message, dict):
+            message = {}
+        LOGGER.warning(
+            "Agora renew_token rejected: result=%s error_code=%s error_str=%s",
+            response.get("_result"),
+            response.get("error_code", message.get("error_code")),
+            response.get("error_str", message.get("error_str")),
+        )
+        return False
+
+    async def _handle_reply(self, response: dict[str, Any]) -> None:
+        """Resolve a pending renewal only for its exact request id."""
+        request_id = response.get("_id")
+        if not isinstance(request_id, str):
+            return
+        future = self._token_renewals.get(request_id)
+        if future is None or future.done():
+            return
+        future.set_result(response)
 
     async def _handle_join_success(
         self,
@@ -1268,6 +1345,12 @@ class AgoraWebSocketHandler:
                 tasks_to_wait.append(self._subscribe_retry_task)
         self._subscribe_retry_task = None
 
+        if self._token_renew_task and not self._token_renew_task.done():
+            self._token_renew_task.cancel()
+            if self._token_renew_task is not current_task:
+                tasks_to_wait.append(self._token_renew_task)
+        self._token_renew_task = None
+
         if self._message_loop_task and not self._message_loop_task.done():
             self._message_loop_task.cancel()
             if self._message_loop_task is not current_task:
@@ -1290,6 +1373,10 @@ class AgoraWebSocketHandler:
         self._pending_answer_ortc = None
         self._pending_offer_info = None
         self._connection_state = "DISCONNECTED"
+        for future in self._token_renewals.values():
+            if not future.done():
+                future.set_result({})
+        self._token_renewals.clear()
         self._video_streams.clear()
         self._subscribed_video_streams.clear()
         self._online_users.clear()
