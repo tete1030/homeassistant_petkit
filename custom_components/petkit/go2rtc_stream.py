@@ -189,10 +189,16 @@ class PetkitGo2RTCStreamManager:
         stream_name = self.stream_name(device_id)
         lock = self._locks.setdefault(stream_name, asyncio.Lock())
         async with lock:
-            for params in ({"dst": stream_name}, {"name": stream_name}):
+            for params in (
+                {"src": stream_name},
+                {"dst": stream_name},
+                {"name": stream_name},
+            ):
                 status, _ = await self._async_call_api(base_url, "delete", params)
                 if status in (HTTPStatus.OK, HTTPStatus.NO_CONTENT):
-                    return True
+                    streams = await self._async_get_streams(base_url)
+                    if streams is not None and stream_name not in streams:
+                        return True
                 if status == HTTPStatus.NOT_FOUND:
                     continue
         return False

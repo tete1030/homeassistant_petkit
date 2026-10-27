@@ -151,6 +151,21 @@ currently sends it before joining. That difference was not proven to cause the
 withdrawal and is intentionally unchanged. The patch does not promise to make
 an unpublished device publish, or solve every long-running interruption.
 
+## Shared stream registration after startup
+
+The camera previously attempted registration only when the entity was added.
+If go2rtc was unavailable at that moment, or restarted later and lost its
+in-memory stream registry, an external RTSP consumer could keep retrying a
+missing source indefinitely. The camera now retries registration every 30
+seconds while it exists. Retries are serialized with entity removal, and
+cleanup confirms the source was actually removed: some go2rtc versions return
+HTTP 200 for a DELETE request that omitted the required `src` parameter.
+
+A controlled deployment test removed the named Petkit source, observed it
+absent, and saw it automatically reappear after approximately 27 seconds.
+The exact reason for an earlier failed startup registration was not recorded.
+Successful registration does not guarantee that a device will publish video.
+
 ## Reproduce the tests
 
 With Python 3.14.2 or newer:

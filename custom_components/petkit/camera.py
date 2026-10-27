@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import timedelta
 from enum import Enum, auto
 from pathlib import Path
 
@@ -39,6 +40,7 @@ from homeassistant.components.camera.const import StreamType
 from homeassistant.components.web_rtc import async_register_ice_servers
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.network import NoURLAvailableError, get_url
 
 from .agora_api import SERVICE_IDS, AgoraAPIClient, AgoraResponse
@@ -163,6 +165,8 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         self._ice_servers: list[RTCIceServer] = []
         self._remove_ice_servers: Callable[[], None] | None = None
         self._go2rtc_browser_sessions: dict[str, _BrowserSession] = {}
+        self._go2rtc_registration_lock = asyncio.Lock()
+        self._go2rtc_registration_active = False
 
     @property
     def available(self) -> bool:
@@ -192,19 +196,37 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         await super().async_added_to_hass()
         self.hass.data.setdefault(DOMAIN, {}).setdefault("cameras", {})
         self.hass.data[DOMAIN]["cameras"][str(self.device.id)] = self
-        if get_go2rtc_stream_manager(self.hass).is_available():
-            try:
-                await get_go2rtc_stream_manager(self.hass).async_ensure_stream(self)
-            except RuntimeError as err:
-                LOGGER.debug(
-                    "Failed to register shared go2rtc stream for %s: %s",
-                    self.device.id,
-                    err,
-                )
+        self._go2rtc_registration_active = True
+        self.async_on_remove(
+            async_track_time_interval(
+                self.hass, self._async_refresh_go2rtc_stream, timedelta(seconds=30)
+            )
+        )
+        await self._async_refresh_go2rtc_stream(None)
         self._remove_ice_servers = async_register_ice_servers(
             self.hass,
             self.get_ice_servers,
         )
+
+    async def _async_refresh_go2rtc_stream(self, _now) -> None:
+        """Restore the shared source after startup failures or go2rtc restarts."""
+        # A slow registration must not build up concurrent retries or race removal.
+        if self._go2rtc_registration_lock.locked():
+            return
+        async with self._go2rtc_registration_lock:
+            if not self._go2rtc_registration_active:
+                return
+            manager = get_go2rtc_stream_manager(self.hass)
+            if not manager.is_available():
+                return
+            try:
+                await manager.async_ensure_stream(self)
+            except Exception as err:  # noqa: BLE001
+                LOGGER.warning(
+                    "Failed to register shared go2rtc stream for %s: %s",
+                    self.device.id,
+                    err,
+                )
 
     async def async_will_remove_from_hass(self) -> None:
         """Cleanup callbacks and websocket sessions."""
@@ -214,8 +236,10 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         if DOMAIN in self.hass.data and "cameras" in self.hass.data[DOMAIN]:
             self.hass.data[DOMAIN]["cameras"].pop(str(self.device.id), None)
 
-        if get_go2rtc_stream_manager(self.hass).is_available():
-            await get_go2rtc_stream_manager(self.hass).async_remove_stream(self)
+        self._go2rtc_registration_active = False
+        async with self._go2rtc_registration_lock:
+            if get_go2rtc_stream_manager(self.hass).is_available():
+                await get_go2rtc_stream_manager(self.hass).async_remove_stream(self)
         await self._async_close_stream()
         await super().async_will_remove_from_hass()
 
