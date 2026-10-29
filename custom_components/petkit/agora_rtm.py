@@ -112,6 +112,18 @@ class AgoraRTMSignaling:
             ):
                 self._token = token
 
+    async def update_rtm_token(self, app_user_id: str, token: str) -> bool:
+        """Apply account RTM credentials only to their existing sender identity."""
+        if not isinstance(app_user_id, str) or not isinstance(token, str):
+            return False
+        if not app_user_id.strip() or not token.strip():
+            return False
+        async with self._state_lock:
+            if self._app_user_id != app_user_id or not self._device_user_id:
+                return False
+            self._token = token
+            return True
+
     @staticmethod
     def _extract_rtm_credentials(
         live_feed: LiveFeed,

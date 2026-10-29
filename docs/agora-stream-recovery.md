@@ -185,3 +185,31 @@ callbacks/DELETE, token-renewal acknowledgement/timeout, concurrent creation,
 cancellation, and shutdown.
 
 These are offline regression tests, not deployment or picture-quality acceptance.
+
+## Keep RTM credential refresh separate from device activation
+
+The periodic shared-WHEP RTM refresh previously used `get_live_feed()`, which
+calls the device's `start/live` endpoint. This is an activation request, not a
+read-only token endpoint. The Android control implementation instead obtains
+account RTM credentials from `device/start/rtm`.
+
+The background RTM refresh now uses that account endpoint and applies its token
+only when `appRtmUserId` matches the existing RTM sender. An empty device list is
+valid for this token-only operation; it does not replace the current device peer,
+channel, RTC token or publication state. Missing/mismatched responses leave the
+current token intact. Expected request failures do not terminate the refresh
+loop, and cancellation still terminates it. RTC renewal retains its separate,
+acknowledgement-tracked provider.
+
+A six-hour observation recorded six successful RTC renewals and one subsequent
+withdrawal. Failed recovery attempts had valid join/ORTC replies but RTM
+`message_offline` responses and no device publication. Recovery followed a later
+`message_delivered` response and a real video announcement. The withdrawal
+notification contained no reason. Its proximity to a periodic `start/live`
+request is a reason to remove that unnecessary activation from maintenance,
+not proof that the request caused the withdrawal. This change does not claim to
+explain device-side RTM logout or reproduce the complete native SDK lifecycle.
+
+Tests exercise the actual refresh coroutine and RTM token updater, including
+wrong sender, missing fields, empty device list, transient failures, cancellation,
+and the invariant that background RTM maintenance never requests video activation.

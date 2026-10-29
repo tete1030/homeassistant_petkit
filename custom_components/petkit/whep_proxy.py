@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass
-from http import HTTPStatus
+from http import HTTPMethod, HTTPStatus
 import secrets
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
+from pypetkitapi.exceptions import PypetkitError
 from sdp_transform import parse as sdp_parse
 from webrtc_models import RTCIceCandidateInit
 
@@ -24,7 +25,6 @@ from .agora_rtm import AgoraRTMSignaling
 from .agora_websocket import AgoraVideoNotPublishedError, AgoraWebSocketHandler
 from .const import AGORA_APP_ID, DOMAIN, LOGGER
 from .go2rtc_stream import get_go2rtc_stream_manager
-from .webrtc_common import _get_live_feed_for_webrtc
 
 if TYPE_CHECKING:
     from .camera import PetkitWebRTCCamera
@@ -328,13 +328,31 @@ class PetkitAgoraUpstreamManager:
             await self.close_session(device_id)
 
     async def _refresh_tokens(self, session: AgoraUpstreamSession) -> None:
-        """Refresh RTM tokens while the upstream session is alive."""
+        """Refresh RTM credentials without calling the device's start/live API."""
         while True:
             await asyncio.sleep(TOKEN_REFRESH_INTERVAL_SECONDS)
-            live_feed = await _get_live_feed_for_webrtc(session.camera)
-            if live_feed is None:
-                continue
-            await session.agora_rtm.update_tokens(live_feed)
+            try:
+                client = session.camera.coordinator.config_entry.runtime_data.client
+                response = await client.req.request(
+                    method=HTTPMethod.GET,
+                    url="device/start/rtm",
+                    headers=await client.get_session_id(),
+                )
+                if not isinstance(response, dict):
+                    LOGGER.warning(
+                        "Invalid RTM credential response; keeping current token"
+                    )
+                    continue
+                updated = await session.agora_rtm.update_rtm_token(
+                    response.get("appRtmUserId"), response.get("rtmToken")
+                )
+                if not updated:
+                    LOGGER.warning(
+                        "RTM credentials missing or sender identity changed; "
+                        "keeping current token"
+                    )
+            except (PypetkitError, ClientError, TimeoutError):
+                LOGGER.warning("RTM credential refresh failed; keeping current token")
 
 
 class PetkitGo2RTCProxyManager:
