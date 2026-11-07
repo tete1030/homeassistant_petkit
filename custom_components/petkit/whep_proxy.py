@@ -6,7 +6,9 @@ import asyncio
 import contextlib
 from dataclasses import dataclass
 from http import HTTPMethod, HTTPStatus
+import math
 import secrets
+from time import monotonic
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
@@ -33,6 +35,20 @@ if TYPE_CHECKING:
 TOKEN_REFRESH_INTERVAL_SECONDS = 20 * 60
 _GO2RTC_WHEP_PATH = "api/webrtc"
 _REQUEST_TIMEOUT = ClientTimeout(total=15)
+RECOVERY_BACKOFF_SECONDS = (15.0, 30.0, 60.0, 120.0, 300.0)
+RECOVERY_IN_PROGRESS_RETRY_AFTER_SECONDS = 1.0
+
+
+class AgoraUpstreamRecoveryBackoff(RuntimeError):
+    """Reject a new WHEP attempt until the current recovery window expires."""
+
+    def __init__(self, retry_after: float, reason: str) -> None:
+        """Expose a bounded Retry-After value without leaking credentials."""
+        self.retry_after = max(1, math.ceil(retry_after))
+        self.reason = reason
+        super().__init__(
+            f"Agora upstream recovery backoff for {self.retry_after}s: {reason}"
+        )
 
 
 def _check_external_auth(request: web.Request) -> web.Response | None:
@@ -102,6 +118,16 @@ class AgoraUpstreamSession:
 
 
 @dataclass
+class _DeviceRecoveryState:
+    """Track one device's bounded recovery attempt and cooldown."""
+
+    failures: int = 0
+    retry_at: float = 0.0
+    in_flight: bool = False
+    last_error: str = ""
+
+
+@dataclass
 class Go2RTCProxySession:
     """One public WHEP session proxied to the internal go2rtc stream."""
 
@@ -119,6 +145,7 @@ class PetkitAgoraUpstreamManager:
         self._lock = asyncio.Lock()
         self._sessions: dict[str, AgoraUpstreamSession] = {}
         self._device_locks: dict[str, asyncio.Lock] = {}
+        self._recovery_states: dict[str, _DeviceRecoveryState] = {}
         self._closing = False
 
     async def create_session(
@@ -130,10 +157,32 @@ class PetkitAgoraUpstreamManager:
         if self._closing:
             raise RuntimeError("Agora upstream manager is closing")
         device_id = str(camera.device.id)
+        # Reject duplicate/backoff requests before waiting on the device lock;
+        # otherwise a burst of WHEP requests would queue behind one recovery.
+        self._raise_if_recovery_blocked_locked(device_id)
         async with self._device_locks.setdefault(device_id, asyncio.Lock()):
             if self._closing:
                 raise RuntimeError("Agora upstream manager is closing")
-            return await self._create_session_locked(camera, offer_sdp, device_id)
+            self._raise_if_recovery_blocked_locked(device_id)
+            state = self._recovery_states.setdefault(device_id, _DeviceRecoveryState())
+            state.in_flight = True
+            try:
+                result = await self._create_session_locked(camera, offer_sdp, device_id)
+            except asyncio.CancelledError:
+                self._record_recovery_failure_locked(
+                    device_id, "recovery attempt cancelled"
+                )
+                raise
+            except Exception as err:
+                self._record_recovery_failure_locked(
+                    device_id, str(err) or type(err).__name__
+                )
+                raise
+            else:
+                self._record_recovery_success_locked(device_id)
+                return result
+            finally:
+                state.in_flight = False
 
     async def _create_session_locked(
         self, camera: PetkitWebRTCCamera, offer_sdp: str, device_id: str
@@ -164,8 +213,8 @@ class PetkitAgoraUpstreamManager:
             nonlocal connection_lost
             connection_lost = True
             self.hass.async_create_task(
-                self.close_session(device_id, session_id=session_id),
-                f"petkit upstream cleanup {device_id}",
+                self._handle_connection_lost(device_id, session_id),
+                f"petkit upstream recovery {device_id}",
             )
 
         agora_handler = AgoraWebSocketHandler(
@@ -238,6 +287,68 @@ class PetkitAgoraUpstreamManager:
                 await self._finish_session_cleanup(session)
 
         return session_id, answer_sdp
+
+    def _raise_if_recovery_blocked_locked(self, device_id: str) -> None:
+        """Fail fast instead of queueing a burst of Agora recovery attempts."""
+        state = self._recovery_states.get(device_id)
+        if state is None:
+            return
+        if state.in_flight:
+            raise AgoraUpstreamRecoveryBackoff(
+                RECOVERY_IN_PROGRESS_RETRY_AFTER_SECONDS,
+                "another recovery attempt is already in progress",
+            )
+        retry_after = state.retry_at - monotonic()
+        if retry_after > 0:
+            raise AgoraUpstreamRecoveryBackoff(
+                retry_after,
+                state.last_error or "recent publication loss",
+            )
+
+    def _record_recovery_failure_locked(self, device_id: str, reason: str) -> None:
+        """Advance the bounded backoff after a failed recovery attempt."""
+        state = self._recovery_states.setdefault(device_id, _DeviceRecoveryState())
+        state.failures = min(state.failures + 1, len(RECOVERY_BACKOFF_SECONDS))
+        delay = RECOVERY_BACKOFF_SECONDS[state.failures - 1]
+        state.retry_at = monotonic() + delay
+        state.last_error = reason[:240]
+        LOGGER.warning(
+            "Agora upstream recovery for %s failed (%d/%d): %s; "
+            "next attempt in %.0fs",
+            device_id,
+            state.failures,
+            len(RECOVERY_BACKOFF_SECONDS),
+            state.last_error,
+            delay,
+        )
+
+    def _record_recovery_success_locked(self, device_id: str) -> None:
+        """Reset backoff only after a real publication-backed session registers."""
+        state = self._recovery_states.get(device_id)
+        if state is None:
+            return
+        if state.failures:
+            LOGGER.info(
+                "Agora upstream recovery for %s succeeded after %d failed attempts",
+                device_id,
+                state.failures,
+            )
+        state.failures = 0
+        state.retry_at = 0.0
+        state.last_error = ""
+
+    async def _handle_connection_lost(self, device_id: str, session_id: str) -> None:
+        """Invalidate one lost publication and start its bounded cooldown."""
+        async with self._device_locks.setdefault(device_id, asyncio.Lock()):
+            async with self._lock:
+                session = self._sessions.get(device_id)
+                if session is None or session.session_id != session_id:
+                    return
+                self._sessions.pop(device_id)
+            self._record_recovery_failure_locked(
+                device_id, "Agora video publication removed"
+            )
+            await self._finish_session_cleanup(session)
 
     async def close_session(
         self, device_id: str, *, session_id: str | None = None
@@ -326,6 +437,7 @@ class PetkitAgoraUpstreamManager:
         device_ids = list(self._device_locks)
         for device_id in device_ids:
             await self.close_session(device_id)
+        self._recovery_states.clear()
 
     async def _refresh_tokens(self, session: AgoraUpstreamSession) -> None:
         """Refresh RTM credentials without calling the device's start/live API."""
@@ -637,6 +749,13 @@ class PetkitUpstreamWhepView(HomeAssistantView):
         try:
             session_id, answer_sdp = await _get_upstream_manager(hass).create_session(
                 camera, offer_sdp
+            )
+        except AgoraUpstreamRecoveryBackoff as err:
+            LOGGER.debug("go2rtc upstream WHEP deferred for %s: %s", device_id, err)
+            return web.Response(
+                status=503,
+                text=str(err),
+                headers={"Retry-After": str(err.retry_after)},
             )
         except (OSError, RuntimeError, ValueError) as err:
             LOGGER.error("go2rtc upstream WHEP failed for %s: %s", device_id, err)

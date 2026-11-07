@@ -202,19 +202,89 @@ async def test_replacement_waits_for_teardown(env):
     assert env.events.index(("stop_end", 0)) < env.events.index(("start", 1))
 
 
-async def test_concurrent_creates_leave_one_owned_session(env):
-    """Serialize creation, not just dictionary writes."""
+async def test_concurrent_create_fails_fast_while_recovery_is_in_flight(env, streaming):
+    """Do not queue a second Agora attempt behind an in-flight recovery."""
     env.join_gate = asyncio.Event()
     first = asyncio.create_task(env.manager.create_session(camera(), ""))
     await wait_until(lambda: bool(env.handlers))
-    second = asyncio.create_task(env.manager.create_session(camera(), ""))
-    await asyncio.sleep(0)
+    assert env.manager._recovery_states["42"].in_flight
+    with pytest.raises(streaming.whep.AgoraUpstreamRecoveryBackoff) as err:
+        await env.manager.create_session(camera(), "")
+    assert err.value.retry_after == 1
     assert len(env.handlers) == 1
     env.join_gate.set()
-    a, b = await asyncio.gather(first, second)
-    assert a[0] != b[0]
-    assert env.manager._sessions["42"].session_id == b[0]
+    sid, _ = await first
+    assert env.manager._sessions["42"].session_id == sid
+    assert not env.rtms[0].stopped
+
+
+async def test_publication_loss_starts_backoff_and_cleans_once(env, streaming):
+    """A lost publication invalidates the session and blocks immediate retries."""
+    await env.manager.create_session(camera(), "")
+    old = env.handlers[0]
+    old.callback()
+    await wait_until(lambda: not env.manager._sessions)
+    await asyncio.gather(*env.tasks, return_exceptions=True)
+
+    old.disconnect.assert_awaited_once()
     assert env.rtms[0].stopped
+    with pytest.raises(streaming.whep.AgoraUpstreamRecoveryBackoff):
+        await env.manager.create_session(camera(), "")
+
+
+async def test_publication_loss_backoff_advances_then_success_resets(
+    env, streaming, monkeypatch
+):
+    """Use bounded increasing delays and reset them after a real registration."""
+    now = [100.0]
+    monkeypatch.setattr(streaming.whep, "monotonic", lambda: now[0])
+
+    await env.manager.create_session(camera(), "")
+    env.handlers[0].callback()
+    await wait_until(lambda: not env.manager._sessions)
+    await asyncio.gather(*env.tasks, return_exceptions=True)
+
+    with pytest.raises(streaming.whep.AgoraUpstreamRecoveryBackoff) as first:
+        await env.manager.create_session(camera(), "")
+    assert first.value.retry_after == 15
+
+    now[0] += 15
+    env.join_error = streaming.ws.AgoraVideoNotPublishedError("no publication")
+    with pytest.raises(streaming.ws.AgoraVideoNotPublishedError):
+        await env.manager.create_session(camera(), "")
+
+    with pytest.raises(streaming.whep.AgoraUpstreamRecoveryBackoff) as second:
+        await env.manager.create_session(camera(), "")
+    assert second.value.retry_after == 30
+
+    now[0] += 30
+    env.join_error = None
+    await env.manager.create_session(camera(), "")
+    state = env.manager._recovery_states["42"]
+    assert state.failures == 0
+    assert state.retry_at == 0
+
+
+async def test_recovery_waits_for_lost_session_cleanup(env, streaming, monkeypatch):
+    """The old stop_live/disconnect must finish before a replacement starts."""
+    now = [100.0]
+    monkeypatch.setattr(streaming.whep, "monotonic", lambda: now[0])
+    await env.manager.create_session(camera(), "")
+    old = env.rtms[0]
+    old.stop_gate = asyncio.Event()
+
+    env.handlers[0].callback()
+    await old.stop_entered.wait()
+    now[0] += 15
+    replacement = asyncio.create_task(env.manager.create_session(camera(), ""))
+    await asyncio.sleep(0)
+    assert len(env.rtms) == 1
+
+    old.stop_gate.set()
+    await replacement
+    await env.manager.close_session("42")
+    await asyncio.gather(*env.tasks, return_exceptions=True)
+    assert env.events.index(("stop_end", 0)) < env.events.index(("start", 1))
 
 
 async def test_other_camera_not_blocked_by_teardown(env):
@@ -341,19 +411,18 @@ async def test_close_all_drains_pending_creation_and_rejects_new(env):
     assert env.rtms[0].stopped
 
 
-async def test_shutdown_also_rejects_already_queued_create(env):
-    """A create waiting for the device lock must recheck the shutdown flag."""
+async def test_second_create_fails_fast_before_shutdown(env, streaming):
+    """A duplicate create is rejected instead of waiting behind the first."""
     env.join_gate = asyncio.Event()
     first = asyncio.create_task(env.manager.create_session(camera(), ""))
     await wait_until(lambda: bool(env.handlers))
-    queued = asyncio.create_task(env.manager.create_session(camera(), ""))
-    await asyncio.sleep(0)
+    with pytest.raises(streaming.whep.AgoraUpstreamRecoveryBackoff):
+        await env.manager.create_session(camera(), "")
     close = asyncio.create_task(env.manager.close_all())
     await asyncio.sleep(0)
     env.join_gate.set()
-    for task in (first, queued):
-        with pytest.raises(RuntimeError, match="manager is closing"):
-            await task
+    with pytest.raises(RuntimeError, match="manager is closing"):
+        await first
     await close
     assert len(env.rtms) == 1
     assert not env.manager._sessions
@@ -393,3 +462,18 @@ async def test_http_stale_delete_preserves_new_session(env, streaming):
     assert env.manager._sessions["42"].session_id == new_sid
     response = await view.delete(request(env), "42", new_sid)
     assert response.status == 200
+
+
+async def test_http_backoff_returns_retry_after(env, streaming, monkeypatch):
+    """Expose a bounded retry hint without creating an Agora session."""
+    now = [100.0]
+    monkeypatch.setattr(streaming.whep, "monotonic", lambda: now[0])
+    await env.manager.create_session(camera(), "")
+    env.handlers[0].callback()
+    await wait_until(lambda: not env.manager._sessions)
+    await asyncio.gather(*env.tasks, return_exceptions=True)
+
+    response = await streaming.whep.PetkitUpstreamWhepView().post(request(env), "42")
+    assert response.status == 503
+    assert response.headers["Retry-After"] == "15"
+    assert len(env.handlers) == 1

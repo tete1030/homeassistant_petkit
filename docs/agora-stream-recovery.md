@@ -114,6 +114,25 @@ the captured natural interruption. In particular, the investigated go2rtc WHEP
 client did not issue DELETE requests, so stale DELETE is not presented as that
 incident's trigger.
 
+## Bound publication recovery attempts
+
+A negotiated publication loss now starts a per-device recovery window instead
+of allowing every downstream retry to create another Agora session. The lost
+session is removed once, its WebSocket and RTM resources are torn down while
+the device lock is still held, and the next attempts use bounded delays of
+15, 30, 60, 120 and 300 seconds.
+
+While a recovery is in flight or cooling down, the internal WHEP endpoint
+returns HTTP 503 with `Retry-After`. It does not queue those requests, obtain a
+live feed, send `start_live`, or open another Agora WebSocket. This prevents the
+hundreds-of-connections retry storm observed after publication withdrawal.
+
+The backoff is reset only when a replacement session registers with a real
+announced video SSRC. A join/ORTC reply, HTTP success, RTM acknowledgement, or
+downstream FPS does not reset it. The bounded retry policy improves failure
+containment and teardown ordering; it does not prove why the device withdrew
+the publication or force an unpublished device to publish.
+
 ## Reference behavior and limits
 
 The [Agora Web SDK release bundle](https://download.agora.io/sdk/release/AgoraRTC_N.js)
